@@ -1,127 +1,140 @@
 # 🚀 Advanced IPC Chat Server in C
 
-นี่คือโปรเจคสำหรับวิชา Operating Systems (ACS, KMUTT) ที่สาธิตการทำงานขั้นสูงของ Inter-Process Communication (IPC) และการจัดการ Concurrency ในภาษา C
+**An Operating Systems project (ACS, KMUTT)** demonstrating advanced **Inter-Process Communication (IPC)** and **Concurrency Management** in pure C.
 
-โปรเจคนี้ได้รับการปรับปรุงสถาปัตยกรรมใหม่ทั้งหมด จากเดิมที่เป็น Server Loop ธรรมดา ไปเป็น **Server แบบ Multi-Thread ประสิทธิภาพสูง** โดยใช้สถาปัตยกรรมแบบ **Router-Worker (Producer-Consumer)** เพื่อรองรับการทำงานพร้อมกันจำนวนมาก
-
-เทคโนโลยีหลักที่ใช้:
-* **System V Message Queues:** (`msgget`, `msgsnd`, `msgrcv`)
-* **Pthreads:** (POSIX Threads)
-* **Reader-Writer Locks:** (`pthread_rwlock_t`) สำหรับการเข้าถึง State ที่มีประสิทธิภาพ
-* **Mutexes & Condition Variables:** (`pthread_mutex_t`, `pthread_cond_t`) สำหรับการจัดการ Job Queue
+This project re-engineers the traditional single-loop chat server into a **high-performance multi-threaded architecture**, adopting a **Router–Worker (Producer–Consumer)** model for massive concurrent message handling.
 
 ---
 
-## 🏛️ สถาปัตยกรรม (Architecture)
+## ⚙️ Core Technologies
 
-นี่คือหัวใจของโปรเจคเวอร์ชันใหม่ ซึ่งแก้ปัญหาคอขวด (Bottleneck) และ Race Condition ทั้งหมด
-
-### 1. Client IPC: `IPC_PRIVATE` (การแก้ปัญหา PID)
-
-ในเวอร์ชันนี้ Client **ไม่ใช้ `getpid()` เป็น Key อีกต่อไป**
-1.  **`client.c`** สร้าง Reply Queue (คิวส่วนตัว) โดยใช้ `msgget(IPC_PRIVATE, ...)` ซึ่งจะการันตีว่าได้ ID คิวที่ไม่ซ้ำกับใครในระบบ
-2.  Client จะส่ง `reply_qid` (ID คิวส่วนตัว) นี้ไปให้ Server พร้อมกับคำสั่ง `CMD_REGISTER`
-3.  Server จะเก็บ `reply_qid` นี้ไว้ใน `GlobalRegistry` เพื่อใช้ส่งข้อความกลับหา Client คนนั้นโดยเฉพาะ
-
-### 2. Server Architecture: Router-Worker Pattern
-
-Server ถูกแบ่งการทำงานออกเป็น 3 ส่วนหลัก (และหลายเธรด) เพื่อให้ทำงานขนานกันได้:
-
-* **1. Router Thread (เธรดจัดเส้นทาง)**
-    * เป็นเธรด *เดียว* ที่คอย `msgrcv` (รอรับคำสั่ง) จาก `CONTROL_QUEUE_KEY` (คิวควบคุมหลัก)
-    * **หน้าที่:** รับ `CommandMessage` -> อัปเดต `last_active` ของ Client -> เรียก Handler ที่ถูกต้อง (เช่น `handle_join`, `handle_msg`)
-    * **ความเร็ว:** เธรดนี้ทำงานเร็วมาก เพราะ "ไม่" ทำงานที่ช้า (เช่น `msgsnd`) แค่สร้าง "งาน" (Job) แล้วโยนเข้า Job Queue
-
-* **2. Broadcaster Pool (กลุ่มเธรดกระจายงาน)**
-    * เป็นกลุ่ม Worker Threads (ตามจำนวน `BROADCASTER_COUNT`) ที่รอรับงานจาก Job Queue
-    * **หน้าที่:** `get_job()` (รอจนกว่าจะมีงาน) -> เมื่อได้งาน (เช่น "ส่ง DM" หรือ "Broadcast ไปห้อง #general") เธรดนี้จะทำหน้าที่ `msgsnd` ที่ช้าและน่าเบื่อไปยัง Client ทุกคนที่เกี่ยวข้อง
-    * **ประสิทธิภาพ:** ใช้ `IPC_NOWAIT` ในการ `send_reply` เพื่อป้องกันไม่ให้ Client ที่ค้างเพียงคนเดียว มาบล็อก Server ทั้งระบบ
-
-* **3. Monitor Thread (เธรดเฝ้าระวัง)**
-    * ทำหน้าที่เดิม คือตื่นทุก 10 วินาที เพื่อเช็ค `last_active` และลบ Client ที่ `INACTIVITY_TIMEOUT`
-
-### 3. Data Flow (การไหลของข้อมูล)
-
-สถาปัตยกรรมนี้สร้าง "สายพานการผลิต" ที่ชัดเจน:
-
-`Client` -> `[Control Queue]` -> **(Router)** -> `[Job Queue]` -> **(Broadcaster)** -> `[Reply Queues]` -> `Clients`
+- **System V Message Queues:** `msgget`, `msgsnd`, `msgrcv`  
+- **POSIX Threads (Pthreads):** Multithreading primitives  
+- **Reader–Writer Locks:** `pthread_rwlock_t` for efficient concurrent access  
+- **Mutexes & Condition Variables:** `pthread_mutex_t`, `pthread_cond_t` for job queue synchronization  
 
 ---
 
-## 🔒 การจัดการ Concurrency (Concurrency Model)
+## 🏛️ Architecture Overview
 
-นี่คือส่วนที่ซับซ้อนที่สุดและเป็นหัวใจของความเสถียร:
+This upgraded architecture eliminates **bottlenecks** and **race conditions** found in earlier versions.
 
-* **`GlobalRegistry` (สถานะของ Server):**
-    * ข้อมูล `clients` และ `rooms` ทั้งหมดถูกเก็บไว้ที่นี่
-    * ถูกป้องกันโดย **`pthread_rwlock_t` (Reader-Writer Lock)**
-    * **ทำไม?** เพราะการ "อ่าน" ข้อมูล (เช่น `handle_msg`, `handle_dm`) เกิดขึ้นบ่อยกว่าการ "เขียน" (เช่น `handle_join`, `handle_quit`) RW-Lock อนุญาตให้หลายเธรด *อ่านพร้อมกันได้* แต่จะบล็อกเมื่อมีการ *เขียน* -> ประสิทธิภาพสูงกว่า Mutex ธรรมดามาก
+### 1. Client IPC — `IPC_PRIVATE` Queues (PID-safe)
+Each client now creates a **private reply queue** using `msgget(IPC_PRIVATE, ...)`, ensuring a unique queue ID system-wide.
 
-* **`Job Queue` (งานที่รอทำ):**
-    * เป็น Linked List ที่ Router (ผู้ผลิต) สร้าง และ Broadcaster (ผู้บริโภค) หยิบไปทำ
-    * ถูกป้องกันโดย **`pthread_mutex_t`** (ป้องกันการเข้าถึงคิว) และ **`pthread_cond_t`** (ใช้ปลุกเธรด Broadcaster ที่กำลัง "หลับ" เมื่อมีงานใหม่เข้ามา)
-
----
-
-## 📁 ส่วนประกอบไฟล์ (File Breakdown)
-
-* **`project_defs.h` (The Contract)**
-    * ไฟล์ "สัญญา" ที่ทั้ง Server และ Client ต้องใช้ร่วมกัน
-    * กำหนด `CommandCode` (Enum) สำหรับทุกคำสั่ง
-    * กำหนดโครงสร้าง `CommandMessage` (Client -> Server)
-    * กำหนดโครงสร้าง `ReplyMessage` (Server -> Client)
-    * กำหนดโครงสร้าง `Job` (สำหรับ Job Queue ภายใน Server)
-    * กำหนดโครงสร้าง `GlobalRegistry` (สำหรับสถานะ Server)
-
-* **`main.c` (The Server)**
-    * **`main()`:** สร้างคิวหลัก, สร้าง `pthread_rwlock_t`, และสร้างเธรดทั้ง 3 ประเภท (Router, Broadcaster Pool, Monitor)
-    * **`router_thread()`:** ลูปหลักที่รับ `CommandMessage` และเรียก `handle_...`
-    * **`handle_...()`:** ฟังก์ชันที่ "สร้าง" `Job` (เช่น `handle_msg` จะสร้าง `Job` ประเภท `CMD_MSG`) แล้วเรียก `add_job()`
-    * **`add_job()` / `get_job()`:** ฟังก์ชันจัดการ Job Queue (ป้องกันด้วย Mutex/Cond)
-    * **`broadcaster_thread()`:** ลูปหลักของ Worker ที่รอ `get_job()` แล้วเรียก `send_reply()`
-    * **`send_reply()`:** ฟังก์ชันเดียวที่เรียก `msgsnd` โดยใช้ `IPC_NOWAIT`
-    * **`monitor_clients()`:** ลูปที่คอยเช็ค Timeout (ต้องใช้ `wrlock` เพราะอาจเรียก `remove_client`)
-
-* **`client.c` (The Client)**
-    * **`main()`:** สร้าง `reply_qid` ด้วย `IPC_PRIVATE`, เชื่อมต่อคิว Server, ส่ง `CMD_REGISTER` และสร้าง 2 เธรด
-    * **`sender_thread()`:** รอ `fgets` จากผู้ใช้, แยกวิเคราะห์คำสั่ง (เช่น "JOIN #room", "MSG ..."), สร้าง `CommandMessage` struct และเรียก `send_command()`
-    * **`receiver_thread()`:** รอ `msgrcv` บน `reply_qid` ส่วนตัว เมื่อ `ReplyMessage` มาถึง ก็จะพิมพ์ออกหน้าจอ
-    * **`cleanup()`:** `msgctl(reply_qid, IPC_RMID, NULL)` เพื่อลบคิวส่วนตัวก่อนปิด
+**Flow:**
+1. The client sends `CMD_REGISTER` with its `reply_qid` to the server.  
+2. The server stores this `reply_qid` in the `GlobalRegistry`.  
+3. Replies are sent directly to each client’s private queue.
 
 ---
 
-## 🛠️ การติดตั้งและใช้งาน (Installation & Usage)
+### 2. Server Architecture — Router–Worker Pattern
 
-(วิธีนี้รันทุกอย่างใน Container เดียว ซึ่งเป็นวิธีทดสอบ IPC ที่สะอาดที่สุด)
+The server consists of **three major components** running on **multiple threads**:
+
+#### 🧭 Router Thread
+- Listens for commands on the **CONTROL_QUEUE_KEY**.  
+- Parses incoming `CommandMessage` objects.  
+- Updates client `last_active` status.  
+- Dispatches lightweight "jobs" into the shared `Job Queue`.  
+
+*Optimized for speed — no blocking I/O.*
+
+#### 📡 Broadcaster Pool
+- A pool of worker threads (size defined by `BROADCASTER_COUNT`).  
+- Continuously fetches jobs using `get_job()`.  
+- Performs actual message broadcasting via `msgsnd()` to all relevant clients.  
+- Uses `IPC_NOWAIT` to prevent one slow client from stalling the system.  
+
+#### 🕵️‍♂️ Monitor Thread
+- Runs every 10 seconds to check `last_active`.  
+- Removes inactive clients exceeding `INACTIVITY_TIMEOUT`.
+
+---
+
+### 3. Data Flow Diagram
+Client → [Control Queue] → (Router)
+↓
+[Job Queue] → (Broadcaster Pool)
+↓
+[Reply Queues] → Clients
+
+---
+
+## 🔒 Concurrency Model
+
+### 🗂 GlobalRegistry
+- Stores all client and room states.  
+- Protected by **Reader–Writer Locks** (`pthread_rwlock_t`).  
+- Allows concurrent **reads** but exclusive **writes**, providing better throughput than a standard mutex.
+
+### 🧾 Job Queue
+- Shared between Router (producer) and Broadcasters (consumers).  
+- Implemented as a **thread-safe linked list**.  
+- Guarded by `pthread_mutex_t` and `pthread_cond_t` for signaling when new jobs arrive.
+
+---
+
+## 📁 File Structure
+
+| File | Description |
+|------|--------------|
+| `project_defs.h` | Shared “contract” between server and client — defines enums, structs, and message formats |
+| `main.c` | Server logic (Router, Broadcaster Pool, Monitor) |
+| `client.c` | Client-side logic (sending commands, receiving messages) |
+
+### Breakdown
+
+#### `main.c` (Server)
+- `main()`: Initializes message queues, RW locks, and threads.  
+- `router_thread()`: Receives commands and dispatches jobs.  
+- `broadcaster_thread()`: Executes jobs and sends messages.  
+- `monitor_clients()`: Cleans up inactive users.  
+
+#### `client.c` (Client)
+- `main()`: Creates `reply_qid` and connects to server queue.  
+- `sender_thread()`: Reads user input, parses commands, and sends requests.  
+- `receiver_thread()`: Waits for `ReplyMessage` via private queue.  
+- `cleanup()`: Removes the private queue before exit.
+
+---
+
+## 🛠️ Installation & Usage (with Docker)
 
 ### 1. Build Docker Image
-(ต้องมี `Dockerfile`, `main.c`, `client.c`, `project_defs.h` ใน directory เดียวกัน)
-```bash
-# (Dockerfile ควร COPY . . และ CMD ["sleep", "infinity"])
-docker build -t my-chat-app .
+Place `Dockerfile`, `main.c`, `client.c`, and `project_defs.h` in the same directory.
 
-### 2. รัน Container หลัก (แบบ Detached)
-เปิด Terminal และรันคำสั่งนี้เพื่อสร้าง "กล่อง" ทดสอบ
+```bash
+docker build -t my-chat-app .
+```
+(Dockerfile example should include: COPY . . and CMD ["sleep", "infinity"])
+
+### 2. Run Container (Detached)
 ```bash
 docker run -d --name chat_container my-chat-app
+```
 
-### 3. คอมไพล์และรัน Server
-ใช้ `docker exec` เพื่อสั่งรัน Server *ข้างใน* Container
+### 3. Compile & Run Server
 ```bash
-# คอมไพล์ (ถ้ายังไม่ได้ทำใน Dockerfile)
+# Compile inside container
 docker exec chat_container gcc main.c -o server -lpthread
-# รัน Server เบื้องหลัง
-docker exec -d chat_container /app/server
 
-### 4. รัน Client (ใน Terminal ใหม่)
-เปิด Terminal ใหม่สำหรับ Client แต่ละคน
+# Run server in background
+docker exec -d chat_container /app/server
+```
+
+### 4. Run Client(s)
+Open a new terminal for each client instance.
 ```bash
-# คอมไพล์ (ถ้ายังไม่ได้ทำ)
+# Compile client
 docker exec chat_container gcc client.c -o client -lpthread
-# รัน Client (แบบโต้ตอบ)
+
+# Run interactively
 docker exec -it chat_container /app/client
+```
 
 ### 5. Cleanup
-เมื่อทดสอบเสร็จ ให้หยุดและลบ Container ทิ้ง
 ```bash
 docker stop chat_container && docker rm chat_container
+```
